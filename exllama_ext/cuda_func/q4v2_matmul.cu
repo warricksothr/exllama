@@ -1,8 +1,8 @@
-#include "q4v2_matmul.h"
-#include "column_remap.h"
-#include "util.h"
-#include "matrix.h"
-#include "cuda_compat.h"
+#include "q4v2_matmul.cuh"
+#include "column_remap.cuh"
+#include "../util.cuh"
+#include "../matrix.cuh"
+#include "../cuda_compat.cuh"
 
 // Block size
 
@@ -10,7 +10,7 @@ const int THREADS_X = 32;       // Block size and thread count along columns in 
 const int THREADS_Y = 1;        // Block size and thread count along rows in x and out
 const int BLOCK_SIZE_Z = 512;   // Block size (1 thread per block) along columns in x, rows in w
 
-template<bool use_g_idx>
+template<bool use_g_idx, bool use_groupsize>
 __global__ void q4v2_matmul_kernel
 (
     const half* x,
@@ -43,6 +43,14 @@ __global__ void q4v2_matmul_kernel
     MatrixView_q4_row w_zeros_(w_zeros, dim / groupsize, width);
     MatrixView_q4_column w_(w, dim, width);
     MatrixView_half_rw out_(out, height, width);
+
+    // Zero output
+
+    if (blockIdx.z == 0)
+    {
+        out_.set(x_row, w_column, {});
+        __syncthreads();
+    }
 
     // Group for zeros and scales
 
@@ -99,15 +107,33 @@ __global__ void q4v2_matmul_kernel
     }
     else
     {
-        // Assume groupsize divides BLOCK_SIZE_Z so we always start on a group boundary
-
-        for (int k = x_column, group = x_column / groupsize; k < x_column + iterations * 8; group++)
+        if constexpr (use_groupsize)
         {
-            half2 w_scale = w_scales_.item_half2half2(group, w_column);
-            uint32_t w_zero = w_zeros_.item(group, w_column) + 1;
+            // For quant matrices where groupsize divides BLOCK_SIZE_Z we always start on a group boundary, so this
+            // coule be slightly faster
 
-            acc = dot_product_8(acc, x_, x_row, k, w_, k, w_column, w_scale, w_zero, groupsize / 8);
-            k += groupsize;
+            for (int k = x_column, group = x_column / groupsize; k < x_column + iterations * 8; group++)
+            {
+                half2 w_scale = w_scales_.item_half2half2(group, w_column);
+                uint32_t w_zero = w_zeros_.item(group, w_column) + 1;
+
+                acc = dot_product_8(acc, x_, x_row, k, w_, k, w_column, w_scale, w_zero, groupsize / 8);
+                k += groupsize;
+            }
+        }
+        else
+        {
+            // Otherwise assume groupsize is a multiple of 8, do 8 columns per iteration and trust the cache
+
+            for (int k = x_column; k < x_column + iterations * 8; )
+            {
+                int group = x_column / groupsize;
+                half2 w_scale = w_scales_.item_half2half2(group, w_column);
+                uint32_t w_zero = w_zeros_.item(group, w_column) + 1;
+
+                acc = dot_product_8(acc, x_, x_row, k, w_, k, w_column, w_scale, w_zero, 1);
+                k += 8;
+            }
         }
     }
 
@@ -170,8 +196,18 @@ cudaError_t q4v2_matmul_cuda
             (dim + BLOCK_SIZE_Z - 1) / BLOCK_SIZE_Z
         );
 
-        if (seq_g_idx) q4v2_matmul_kernel <true>  <<<blocks, threads>>>(x_map ? x_mapped : x, w, out, w_scales, w_zeros, height, dim, width, groupsize, seq_g_idx);
-        else           q4v2_matmul_kernel <false> <<<blocks, threads>>>(x_map ? x_mapped : x, w, out, w_scales, w_zeros, height, dim, width, groupsize, seq_g_idx);
+        // TODO: Clean this all up a bit at some point
+
+        if (BLOCK_SIZE_Z % groupsize == 0)
+        {
+            if (seq_g_idx) q4v2_matmul_kernel <true,  true>  <<<blocks, threads>>>(x_map ? x_mapped : x, w, out, w_scales, w_zeros, height, dim, width, groupsize, seq_g_idx);
+            else           q4v2_matmul_kernel <false, true>  <<<blocks, threads>>>(x_map ? x_mapped : x, w, out, w_scales, w_zeros, height, dim, width, groupsize, seq_g_idx);
+        }
+        else
+        {
+            if (seq_g_idx) q4v2_matmul_kernel <true,  false> <<<blocks, threads>>>(x_map ? x_mapped : x, w, out, w_scales, w_zeros, height, dim, width, groupsize, seq_g_idx);
+            else           q4v2_matmul_kernel <false, false> <<<blocks, threads>>>(x_map ? x_mapped : x, w, out, w_scales, w_zeros, height, dim, width, groupsize, seq_g_idx);
+        }
 
 //         cudaDeviceSynchronize();
 //         _cuda_check(cudaGetLastError());

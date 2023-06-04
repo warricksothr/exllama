@@ -2,6 +2,7 @@ import argparse
 import torch
 import sys
 import os
+import glob
 
 from .model import ExLlama, ExLlamaCache, ExLlamaConfig
 from .tokenizer import ExLlamaTokenizer
@@ -16,13 +17,14 @@ torch.cuda._lazy_init()
 
 parser = argparse.ArgumentParser(description = "Simple chatbot example for ExLlama")
 
-parser.add_argument("-t", "--tokenizer", type = str, help = "Tokenizer model path", required = True)
-parser.add_argument("-c", "--config", type = str, help = "Model config path (config.json)", required = True)
-parser.add_argument("-m", "--model", type = str, help = "Model weights path (.pt or .safetensors file)", required = True)
+parser.add_argument("-t", "--tokenizer", type = str, help = "Tokenizer model path")
+parser.add_argument("-c", "--config", type = str, help = "Model config path (config.json)")
+parser.add_argument("-m", "--model", type = str, help = "Model weights path (.pt or .safetensors file)")
+parser.add_argument("-d", "--directory", type = str, help = "Path to directory containing config.json, model.tokenizer and * .safetensors")
 
-parser.add_argument("-a", "--attention", type = ExLlamaConfig.AttentionMethod.argparse, choices = list(ExLlamaConfig.AttentionMethod), help="Attention method", default = ExLlamaConfig.AttentionMethod.PYTORCH_SCALED_DP)
+parser.add_argument("-a", "--attention", type = ExLlamaConfig.AttentionMethod.argparse, choices = list(ExLlamaConfig.AttentionMethod), help="Attention method", default = ExLlamaConfig.AttentionMethod.SWITCHED)
 parser.add_argument("-mm", "--matmul", type = ExLlamaConfig.MatmulMethod.argparse, choices = list(ExLlamaConfig.MatmulMethod), help="Matmul method", default = ExLlamaConfig.MatmulMethod.SWITCHED)
-parser.add_argument("-s", "--stream", type = int, help = "Stream layer interval", default = 0)
+parser.add_argument("-mlp", "--mlp", type = ExLlamaConfig.MLPMethod.argparse, choices = list(ExLlamaConfig.MLPMethod), help="Matmul method", default = ExLlamaConfig.MLPMethod.SWITCHED)
 parser.add_argument("-gs", "--gpu_split", type = str, help = "Comma-separated list of VRAM (in GB) to use per GPU device for model layers, e.g. -gs 20,7,7")
 parser.add_argument("-dq", "--dequant", type = str, help = "Number of layers (per GPU) to de-quantize at load time")
 
@@ -43,7 +45,26 @@ parser.add_argument("-repps", "--repetition_penalty_sustain", type = int, help =
 parser.add_argument("-beams", "--beams", type = int, help = "Number of beams for beam search", default = 1)
 parser.add_argument("-beamlen", "--beam_length", type = int, help = "Number of future tokens to consider", default = 1)
 
+parser.add_argument("-gpfix", "--gpu_peer_fix", action = "store_true", help = "Prevent direct copies of data between GPUs")
+
 args = parser.parse_args()
+
+if args.directory is not None:
+    args.tokenizer = os.path.join(args.directory, "tokenizer.model")
+    args.config = os.path.join(args.directory, "config.json")
+    st_pattern = os.path.join(args.directory, "*.safetensors")
+    st = glob.glob(st_pattern)
+    if len(st) == 0:
+        print(f" !! No files matching {st_pattern}")
+        sys.exit()
+    if len(st) > 1:
+        print(f" !! Multiple files matching {st_pattern}")
+        sys.exit()
+    args.model = st[0]
+else:
+    if args.tokenizer is None or args.config is None or args.model is None:
+        print(" !! Please specify either -d or all of -t, -c and -m")
+        sys.exit()
 
 # Some feedback
 
@@ -62,11 +83,12 @@ print(f" -- Beams: {args.beams} x {args.beam_length}")
 print_opts = []
 print_opts.append("attention: " + str(args.attention))
 print_opts.append("matmul: " + str(args.matmul))
+print_opts.append("mlp: " + str(args.mlp))
 if args.no_newline: print_opts.append("no_newline")
 if args.botfirst: print_opts.append("botfirst")
-if args.stream > 0: print_opts.append(f"stream: {args.stream}")
 if args.gpu_split is not None: print_opts.append(f"gpu_split: {args.gpu_split}")
 if args.dequant is not None: print_opts.append(f"dequant: {args.dequant}")
+if args.gpu_peer_fix: print_opts.append("gpu_peer_fix")
 
 print(f" -- Options: {print_opts}")
 
@@ -93,7 +115,8 @@ config = ExLlamaConfig(args.config)
 config.model_path = args.model
 config.attention_method = args.attention
 config.matmul_method = args.matmul
-config.stream_layer_interval = args.stream
+config.mlp_method = args.mlp
+config.gpu_peer_fix = args.gpu_peer_fix
 if args.length is not None: config.max_seq_len = args.length
 config.set_auto_map(args.gpu_split)
 config.set_dequant(args.dequant)
@@ -204,7 +227,10 @@ while True:
         num_res_tokens += 1
         text = tokenizer.decode(generator.sequence_actual[:, -num_res_tokens:][0])
         new_text = text[len(res_line):]
+
+        skip_space = res_line.endswith("\n") and new_text.startswith(" ")  # Bit prettier console output
         res_line += new_text
+        if skip_space: new_text = new_text[1:]
 
         print(new_text, end="")  # (character streaming output is here)
         sys.stdout.flush()

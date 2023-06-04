@@ -1,6 +1,6 @@
-#include "q4v2_recons.h"
-#include "util.h"
-#include "matrix.h"
+#include "q4v2_recons.cuh"
+#include "../util.cuh"
+#include "../matrix.cuh"
 
 // Block size
 
@@ -77,7 +77,6 @@ __global__ void q4v2_recons_kernel
         }
     }
 }
-
 
 // Convert w -> y, from q4 to half
 //

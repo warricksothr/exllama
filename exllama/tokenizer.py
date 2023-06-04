@@ -19,6 +19,12 @@ class ExLlamaTokenizer:
 
     def decode(self, ids):
 
-        ids = ids.tolist()
+        if not isinstance(ids, list):
+            ids = ids.tolist()
         text = self.tokenizer.Decode(ids)
         return text
+
+    def num_tokens(self, text):
+
+        ids = self.tokenizer.Encode(text)
+        return len(ids)

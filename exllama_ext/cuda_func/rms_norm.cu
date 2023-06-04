@@ -1,10 +1,11 @@
-#include "rms_norm.h"
-#include "util.h"
-#include "matrix.h"
+#include "rms_norm.cuh"
+#include "../cuda_buffers.cuh"
+#include "../util.cuh"
+#include "../matrix.cuh"
 
 const int THREADS_X = 16;
 const int THREADS_Y = 4;
-const int BLOCKSIZE_X = 32;
+const int BLOCKSIZE_X = 4;
 
 // scratch = sum(x * x, dim = -1)
 
@@ -21,6 +22,8 @@ __global__ void rms_norm_row_product_kernel
     if (row >= rows) return;
     if (column >= dim) return;
 
+    // Accumulate
+
     float acc = 0.0f;
     int idx = row * dim + column;
 
@@ -28,7 +31,7 @@ __global__ void rms_norm_row_product_kernel
     for (int k = 0; k < BLOCKSIZE_X; k++)
     {
         float m = __half2float(x[idx++]);
-        acc += m * m;
+        acc = fma(m, m, acc);
     }
 
     atomicAdd(&scratch[row], acc);
@@ -72,7 +75,6 @@ __global__ void rms_norm_kernel
     }
 }
 
-
 // x = x * w / sqrt(row_mean(x * x) + epsilon)
 //
 // works in-place if x == out
@@ -82,13 +84,16 @@ cudaError_t rms_norm_cuda
     half* x,
     const half* w,
     half* out,
-    float* scratch,
     const float epsilon,
     const int rows,
-    const int dim
+    const int dim,
+    const int device_index
 )
 {
     cudaError_t _cuda_err = cudaSuccess;
+
+    CudaBuffers* buffers = get_buffers(device_index);
+    buffers->zero_rms_norm_scratch(rows);
 
     float r_dim = 1.0f / (float) dim;
 
@@ -101,11 +106,12 @@ cudaError_t rms_norm_cuda
         1
     );
 
-    rms_norm_row_product_kernel<<<blocks, threads>>>(x, scratch, rows, dim);
-    rms_norm_kernel<<<blocks, threads>>>(x, w, out, scratch, epsilon, r_dim, rows, dim);
+    rms_norm_row_product_kernel<<<blocks, threads>>>(x, buffers->rms_norm_scratch, rows, dim);
+    rms_norm_kernel<<<blocks, threads>>>(x, w, out, buffers->rms_norm_scratch, epsilon, r_dim, rows, dim);
 
 //_cuda_fail:
 
+    //if (scratch) cudaFree(scratch);
+
     return _cuda_err;
 }
-
