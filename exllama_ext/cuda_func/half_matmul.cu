@@ -54,7 +54,7 @@ __global__ void half_matmul_kernel
 #endif
 }
 
-cudaError_t half_matmul_cuda
+void half_matmul_cuda
 (
     const half* x,
     const half* w,
@@ -64,8 +64,6 @@ cudaError_t half_matmul_cuda
     const int width
 )
 {
-    cudaError_t _cuda_err = cudaSuccess;
-
     dim3 threads(THREADS_X, THREADS_Y, 1);
 
     dim3 blocks
@@ -75,22 +73,12 @@ cudaError_t half_matmul_cuda
         (dim + BLOCKSIZE - 1) / BLOCKSIZE
     );
 
-    // printf("%i %i %i\n", height, dim, width);
-
-    // Launch the CUDA kernel
     half_matmul_kernel<<<blocks, threads>>>(x, w, out, height, dim, width);
-
-//     cudaDeviceSynchronize();
-//     _cuda_check(cudaGetLastError());
-//
-// _cuda_fail:
-
-    return _cuda_err;
 }
 
 // cuBLAS can't be beat for large matrices, probably
 
-cudaError_t half_matmul_cublas_cuda
+void half_matmul_cublas_cuda
 (
     const half* x,
     const half* w,
@@ -101,17 +89,8 @@ cudaError_t half_matmul_cublas_cuda
     cublasHandle_t handle
 )
 {
-    cudaError_t _cuda_err = cudaSuccess;
-
     const half alpha = __float2half(1.0f);
     const half beta = __float2half(0.0f);
 
     cublasHgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, width, height, dim, &alpha, w, width, x, dim, &beta, out, width);
-
-//     cudaDeviceSynchronize();
-//     _cuda_check(cudaGetLastError());
-//
-// _cuda_fail:
-
-    return _cuda_err;
 }
