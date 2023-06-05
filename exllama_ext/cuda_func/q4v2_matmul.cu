@@ -140,7 +140,11 @@ __global__ void q4v2_matmul_kernel
     // Add to block result
 
     half result = __hadd(acc.x, acc.y);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+    atomicAdd_half(out_.item_ptr(x_row, w_column), result);
+#else
     atomicAdd(out_.item_ptr(x_row, w_column), result);
+#endif
 }
 
 // Compute y = x @ w

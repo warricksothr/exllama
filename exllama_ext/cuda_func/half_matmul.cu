@@ -47,7 +47,11 @@ __global__ void half_matmul_kernel
     }
 
     // out_.set(row, column, acc);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+    atomicAdd_half2((half2*)out_.item_ptr(row, column), acc);
+#else
     atomicAdd((half2*)out_.item_ptr(row, column), acc);
+#endif
 }
 
 cudaError_t half_matmul_cuda

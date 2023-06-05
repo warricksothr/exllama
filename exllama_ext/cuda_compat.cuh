@@ -41,13 +41,4 @@ __device__ __forceinline__ void atomicAdd_half2(half2* address, half2 val)
 
 //
 
-#ifdef __CUDA_ARCH__
-#if __CUDA_ARCH__ < 700
-
-__device__ __forceinline__ void atomicAdd(half* address, half val) { atomicAdd_half(address, val); }
-__device__ __forceinline__ void atomicAdd(half2* address, half2 val) { atomicAdd_half2(address, val); }
-
-#endif
-#endif
-
 #endif
