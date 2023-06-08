@@ -39,6 +39,4 @@ __device__ __forceinline__ void atomicAdd_half2(half2* address, half2 val)
     while (assumed != old);
 }
 
-//
-
 #endif

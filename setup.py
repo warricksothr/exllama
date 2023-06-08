@@ -1,10 +1,18 @@
 from setuptools import setup, Extension
 from torch.utils import cpp_extension
 import platform
+import torch
+
+extra_compile_args = {
+    "cxx": ["-O3"],
+    "nvcc": ["-O3"],
+}
+if torch.version.hip:
+    extra_compile_args["nvcc"].append("-U__HIP_NO_HALF_CONVERSIONS__")
 
 setup(
     name="exllama",
-    version="0.0.1",
+    version="0.0.2",
     install_requires=[
         "torch",
     ],
@@ -25,7 +33,7 @@ setup(
                 "exllama_ext/cuda_func/q4_mlp.cu",
                 "exllama_ext/cpu_func/rep_penalty.cpp",
             ],
-            extra_compile_args={"nvcc": ["-O3"]},
+            extra_compile_args=extra_compile_args,
             libraries=["cublas"] if platform.system() == "Windows" else [],
         ),
     ],
