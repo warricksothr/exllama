@@ -143,19 +143,11 @@ __global__ void q4_matmul_kernel
     if constexpr (use_half2)
     {
         half result = __hadd(acc.x, acc.y);
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
-        atomicAdd_half(out_.item_ptr(x_row, w_column), result);
-#else
         atomicAdd(out_.item_ptr(x_row, w_column), result);
-#endif
     }
     else
     {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
-        atomicAdd_half(out_.item_ptr(x_row, w_column), acc_h);
-#else
         atomicAdd(out_.item_ptr(x_row, w_column), acc_h);
-#endif
     }
 }
 
