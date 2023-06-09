@@ -30,6 +30,7 @@ setup(
                 "exllama_ext/cuda_func/rms_norm.cu",
                 "exllama_ext/cuda_func/rope.cu",
                 "exllama_ext/cuda_func/half_matmul.cu",
+                "exllama_ext/cuda_func/q4_attn.cu",
                 "exllama_ext/cuda_func/q4_mlp.cu",
                 "exllama_ext/cpu_func/rep_penalty.cpp",
             ],

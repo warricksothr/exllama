@@ -69,26 +69,6 @@ def ext_rope_(x, sin, cos, past_len, num_heads, head_dim):
     rope_(x, sin, cos, past_len, num_heads, head_dim)
 
 
-
-# Llama MLP, compute: (SiLU(x @ gate_proj) * (x @ up_proj)) @ down_proj
-
-def ext_q4_mlp(x,
-               rms_norm_weight,
-               epsilon,
-               gate_proj,
-               up_proj,
-               down_proj):
-
-    x = x.view(-1, x.shape[-1])
-
-    q4_mlp(x,
-           rms_norm_weight,
-           epsilon,
-           gate_proj,
-           up_proj,
-           down_proj)
-
-
 # RMS norm: x = x * w / sqrt(row_mean(x * x) + epsilon)
 
 def ext_rms_norm(x, w, epsilon):
