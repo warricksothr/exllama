@@ -11,7 +11,7 @@ from exllama_ext import make_q4
 from exllama_ext import q4_matmul
 from exllama_ext import half_matmul
 from exllama_ext import half_matmul_cublas
-from exllama_ext import q4_mlp
+# from exllama_ext import q4_mlp
 from exllama_ext import rms_norm
 from exllama_ext import rope_
 from exllama_ext import rep_penalty
