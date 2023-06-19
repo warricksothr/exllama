@@ -4,8 +4,66 @@ from torch.cuda.amp import custom_bwd, custom_fwd
 from torch.utils.cpp_extension import load
 import os
 import sys
+import platform
 
-import exllama_ext
+library_dir = os.path.dirname(os.path.abspath(__file__))
+extension_name = "exllama_ext"
+verbose = False
+
+# another kludge to get things compiling in Windows
+windows = os.name == "nt"
+if windows:
+    def find_msvc():
+        for msvc_dir in [a + "\\Microsoft Visual Studio\\" + b + "\\" + c + "\\VC\Tools\\MSVC\\"
+            for b in ["2022", "2019", "2017"]
+            for a in [os.environ["ProgramW6432"], os.environ["ProgramFiles(x86)"]]
+            for c in ["BuildTools", "Community", "Professional", "Enterprise", "Preview"]
+        ]:
+            if not os.path.exists(msvc_dir):
+                continue
+            versions = sorted(os.listdir(msvc_dir), reverse=True)
+            for version in versions:
+                compiler_dir = msvc_dir + version + "\\bin\\Hostx64\\x64"
+                if os.path.exists(compiler_dir) and os.path.exists(compiler_dir + "\\cl.exe"):
+                    return compiler_dir
+        return None
+    
+    import subprocess
+    try:
+        subprocess.check_output(["where", "cl"])
+    except subprocess.CalledProcessError as e:
+        cl_path = find_msvc()
+        if cl_path:
+            print("Injected compiler path:", cl_path)
+            os.environ["path"] += ";" + cl_path
+        else:
+            print("Unable to find cl.exe; compilation will probably fail.")
+
+exllama_ext = load(
+    name = extension_name,
+    sources = [
+        os.path.join(library_dir, "exllama_ext/exllama_ext.cpp"),
+        os.path.join(library_dir, "exllama_ext/cuda_buffers.cu"),
+        os.path.join(library_dir, "exllama_ext/cuda_func/q4_matrix.cu"),
+        os.path.join(library_dir, "exllama_ext/cuda_func/q4_matmul.cu"),
+        os.path.join(library_dir, "exllama_ext/cuda_func/column_remap.cu"),
+        os.path.join(library_dir, "exllama_ext/cuda_func/rms_norm.cu"),
+        os.path.join(library_dir, "exllama_ext/cuda_func/rope.cu"),
+        os.path.join(library_dir, "exllama_ext/cuda_func/half_matmul.cu"),
+        os.path.join(library_dir, "exllama_ext/cuda_func/q4_attn.cu"),
+        os.path.join(library_dir, "exllama_ext/cuda_func/q4_mlp.cu"),
+        os.path.join(library_dir, "exllama_ext/cpu_func/rep_penalty.cpp")
+    ],
+    extra_include_paths = [os.path.join(library_dir, "exllama_ext")],
+    verbose = verbose,
+    extra_ldflags = ["cublas.lib"] if windows else [],
+    extra_cuda_cflags = ["-lineinfo"] + (["-U__HIP_NO_HALF_CONVERSIONS__", "-O3"] if torch.version.hip else []),
+    extra_cflags = ["-O3"]
+    # extra_cflags = ["-ftime-report", "-DTORCH_USE_CUDA_DSA"]
+)
+
+# from exllama_ext import set_tuning_params
+# from exllama_ext import prepare_buffers
 from exllama_ext import make_q4
 from exllama_ext import q4_matmul
 from exllama_ext import q4_matmul_lora
