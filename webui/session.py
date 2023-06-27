@@ -282,22 +282,23 @@ class Session:
                 jnode["author_idx"] = self.participants.index(author)
 
         dic = {"sessions": names,
-                "current_session": name,
-                "fixed_prompt": self.fixed_prompt.text,
-                "keep_fixed_prompt": self.keep_fixed_prompt,
-                "participants": self.participants,
-                "history": historyjson,
-                "temperature": generator.settings.temperature,
-                "top_p": generator.settings.top_p,
-                "min_p": generator.settings.min_p,
-                "top_k": generator.settings.top_k,
-                "typical": generator.settings.typical,
-                "break_on_newline": self.break_on_newline,
-                "max_response_tokens": self.max_response_tokens,
-                "chunk_size": self.chunk_size,
-                "token_repetition_penalty_max": generator.settings.token_repetition_penalty_max,
-                "token_repetition_penalty_sustain": generator.settings.token_repetition_penalty_sustain,
-                "token_repetition_penalty_decay": generator.settings.token_repetition_penalty_decay}
+               "current_session": name,
+               "fixed_prompt": self.fixed_prompt.text,
+               "keep_fixed_prompt": self.keep_fixed_prompt,
+               "participants": self.participants,
+               "history": historyjson,
+               "temperature": generator.settings.temperature,
+               "top_p": generator.settings.top_p,
+               "min_p": generator.settings.min_p,
+               "top_k": generator.settings.top_k,
+               "typical": generator.settings.typical,
+               "break_on_newline": self.break_on_newline,
+               "max_response_tokens": self.max_response_tokens,
+               "chunk_size": self.chunk_size,
+               "token_repetition_penalty_max": generator.settings.token_repetition_penalty_max,
+               "token_repetition_penalty_sustain": generator.settings.token_repetition_penalty_sustain,
+               "token_repetition_penalty_decay": generator.settings.token_repetition_penalty_decay,
+               "max_seq_len": model.config.max_seq_len}
 
         # Add model info
 
@@ -334,6 +335,22 @@ class Session:
                 node.replace_text(new_text)
                 self.save()
                 return
+
+
+    def api_append_block(self, data):
+
+        author = None
+        if "author" in data:
+            author = data["author"]
+        else:
+            if len(self.participants) > 0:
+                author = self.participants[0]
+
+        text = data["text"].strip()
+
+        newNode = Node(text, author)
+        self.history.append(newNode)
+        self.save()
 
 
     def api_set_participants(self, data):
@@ -599,7 +616,8 @@ class Session:
             end_time = time.time()
             elapsed = end_time - begin_time
             new_tokens = context.shape[-1] - reused
-            print(f"Prompt processed in {elapsed:.2f} seconds, {new_tokens} new tokens, {(new_tokens / elapsed):.2f} tokens/second:")
+            token_rate = 0 if elapsed == 0 else (new_tokens / elapsed)
+            print(f"Prompt processed in {elapsed:.2f} seconds, {new_tokens} new tokens, {token_rate:.2f} tokens/second:")
 
         begin_time = time.time()
         total_tokens = [0]
@@ -676,8 +694,9 @@ class Session:
 
         end_time = time.time()
         elapsed = end_time - begin_time
+        token_rate = 0 if elapsed == 0 else (total_tokens[0] / elapsed)
 
-        print(f"Response generated in {elapsed:.2} seconds, {total_tokens[0]} tokens, {(total_tokens[0] / elapsed):.2f} tokens/second:")
+        print(f"Response generated in {elapsed:.2} seconds, {total_tokens[0]} tokens, {token_rate:.2f} tokens/second:")
 
         self.save()
 

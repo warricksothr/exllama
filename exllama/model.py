@@ -1,3 +1,10 @@
+import sys
+min_version = (3, 9)
+if sys.version_info < min_version:
+    print("")
+    print(f" ## Warning: this project requires Python {min_version[0]}.{min_version[1]} or higher.")
+    print("")
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -64,6 +71,7 @@ class ExLlamaConfig:
         # Optional settings
 
         self.max_seq_len = 2048  # Reduce to save memory. Can also be increased, but the pretrained models produce degenerate output after 2048 tokens in any case. Should be possible to finetune for longer sequence lengths.
+        self.compress_pos_emb = 1.0  # Increase to compress positional embeddings applied to sequence
         self.gpu_peer_fix = False # Apparently Torch can have problems transferring tensors directly one GPU to another sometimes. Enable this to move tensors via system RAM instead, where needed
         self.auto_map = None  # List of floats with memory allocation in GB, per CUDA device, overrides device_map
 
@@ -304,9 +312,9 @@ class ExLlamaAttention:
 
         # Project q, k, v, apply position embeddings to k and v, update cache
 
-        query_states = torch.empty((q_len, self.config.hidden_size), dtype = torch.float16, device = hidden_states.device)
-        key_states = torch.empty((q_len, self.config.hidden_size), dtype = torch.float16, device = hidden_states.device)
-        value_states = torch.empty((q_len, self.config.hidden_size), dtype = torch.float16, device = hidden_states.device)
+        query_states = torch.empty((bsz, q_len, self.config.hidden_size), dtype = torch.float16, device = hidden_states.device)
+        key_states = torch.empty((bsz, q_len, self.config.hidden_size), dtype = torch.float16, device = hidden_states.device)
+        value_states = torch.empty((bsz, q_len, self.config.hidden_size), dtype = torch.float16, device = hidden_states.device)
 
         cuda_ext.exllama_ext.q4_attn(hidden_states,
                                      input_layernorm.weight,
@@ -398,8 +406,7 @@ class ExLlamaAttention:
 
             attn_weights = torch.matmul(query_states, key_states.transpose(2, 3))
             attn_weights /= math.sqrt(self.config.head_dim)
-            if buffer.attn_mask is not None and buffer.attn_mask.shape[2] > 1: attn_weights = attn_weights + buffer.attn_mask
-            # attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min))
+            if buffer.attn_mask is not None: attn_weights = attn_weights + buffer.attn_mask
             attn_weights = nn.functional.softmax(attn_weights, dim = -1, dtype = torch.float16).to(query_states.dtype)
             attn_output = torch.matmul(attn_weights, value_states)
             attn_output = attn_output.transpose(1, 2)
@@ -412,7 +419,7 @@ class ExLlamaAttention:
             # it can only apply a square attention mask. It saves quite a bit of VRAM but in practice Torch seems to use
             # the same amount of memory at peak anyway.
 
-            if past_len > 0:
+            if past_len > 0 or (bsz > 1 and buffer.attn_mask is not None):
                 attn_output = F.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask = buffer.attn_mask, is_causal = False)
             else:
                 attn_output = F.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask = None, is_causal = True)
@@ -616,7 +623,7 @@ def _move_tensor(tensor, new_device, name, config):
     device = str(tensor.device)
     if device == new_device: return tensor
     if config.gpu_peer_fix:
-        if device.startswith("cuda:") and new_device.startswith("cuda:"):
+        if str(device).startswith("cuda:") and str(new_device).startswith("cuda:"):
             tensor = tensor.to("cpu")
     return tensor.to(new_device)
 
@@ -740,6 +747,8 @@ class ExLlama:
 
             inv_freq = 1.0 / (self.config.rotary_embedding_base ** (torch.arange(0, self.config.head_dim, 2, device = device).float() / self.config.head_dim))
             t = torch.arange(self.config.max_seq_len, device = device, dtype = torch.float32)
+            if self.config.compress_pos_emb != 1.0: t /= self.config.compress_pos_emb
+
             freqs = torch.einsum("i,j->ij", t, inv_freq)
             emb = torch.cat((freqs, freqs), dim = -1)
 
@@ -793,7 +802,9 @@ class ExLlama:
         torch.cuda.empty_cache()
 
 
-    def forward(self, input_ids, cache, last_id_only = True, preprocess_only = False, lora = None):
+    def forward(self, input_ids, cache, last_id_only = True, preprocess_only = False, lora = None, output_device = None, input_mask = None):
+
+        assert input_mask is None or input_mask.shape == input_ids.shape
 
         # if torch.is_grad_enabled():
         #     raise ValueError("Forward pass called with gradients enabled. Back propagation is not supported yet.")
@@ -801,6 +812,7 @@ class ExLlama:
 
             batch_size, seq_len = input_ids.shape
             past_len = cache.current_seq_len
+            if output_device is None: output_device = input_ids.device
 
             buffer = ExLlamaBuffer(self.config)
 
@@ -811,8 +823,15 @@ class ExLlama:
             if seq_len > 1:
 
                 attn_mask = torch.zeros(batch_size, 1, seq_len, past_len + seq_len, dtype = torch.float16, device = devs[0])
-                attn_mask_triu = torch.triu(torch.full((seq_len - 1, seq_len - 1), torch.finfo(torch.float16).min))
+                attn_mask_triu = torch.triu(torch.full((seq_len - 1, seq_len - 1), -65504.))
                 attn_mask[:, :, : seq_len - 1, past_len + 1: past_len + seq_len] = attn_mask_triu
+
+                if input_mask is not None:
+
+                    input_mask = _move_tensor(input_mask, devs[0], "input_mask", self.config)
+                    input_mask = torch.where(input_mask, 0, -65504.).half()
+                    input_mask = input_mask.unsqueeze(1).unsqueeze(2)
+                    attn_mask = torch.minimum(attn_mask, input_mask)
 
             else:
 
@@ -824,7 +843,7 @@ class ExLlama:
             # Embeddings
             # TODO: Allow passing input embeddings instead of IDs
 
-            input_ids = _move_tensor(input_ids, "cpu", "input_ids", self.config)
+            input_ids = _move_tensor(input_ids, self.config.device_map.embed_tokens, "input_ids", self.config)
             hidden_states = self.embed_tokens(input_ids)
 
             # Split buffers to devices
@@ -863,5 +882,15 @@ class ExLlama:
             # logits = cuda_ext.matmul_half(hidden_states, self.lm_head_data, cublas = False)
 
             logits = logits.float()
-            logits = _move_tensor(logits, self.config.device_map.embed_tokens, "logits", self.config)
+            logits = _move_tensor(logits, output_device, "logits", self.config)
             return logits
+
+
+    # Free unmanaged resources allocated by the C++ extension. Call this before dereferencing the ExLlama object,
+    # e.g. if you intend to create a new instance to load another model, but don't call it in a destructor that wraps
+    # the object, since it relies on CUDA function calls and the CUDA context is one of the first things to go when
+    # a PyTorch application terminates, before other managed objects are destroyed.
+
+    def free_unmanaged(self):
+
+        cuda_ext.exllama_ext.cleanup()

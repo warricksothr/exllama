@@ -1,6 +1,7 @@
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from model import ExLlama, ExLlamaConfig
 from flask import Flask, render_template, request, jsonify
 from flask import Response, stream_with_context
 from threading import Timer, Lock
@@ -10,7 +11,7 @@ import model_init
 from session import prepare_sessions, get_initial_session, Session, load_session, new_session, _sessions_dir
 import argparse
 from tokenizer import ExLlamaTokenizer
-from model import ExLlama, ExLlamaConfig
+from waitress import serve
 
 app = Flask(__name__)
 app.static_folder = 'static'
@@ -117,12 +118,17 @@ def api_userinput():
         result = Response(stream_with_context(session.respond_multi(user_input)), mimetype = 'application/json')
         return result
 
+@app.route("/api/append_block", methods=['POST'])
+def api_append_block():
+    data = request.get_json()
+    session.api_append_block(data)
+    return json.dumps({"result": "ok"}) + "\n"
 
 # Load the model
 
 parser = argparse.ArgumentParser(description="Simple web-based chatbot for ExLlama")
 parser.add_argument("-host", "--host", type = str, help = "IP:PORT eg, 0.0.0.0:7862", default = "localhost:5000")
-parser.add_argument("-sd", "--sessions-dir", type = str, help = "Location for storing user sessions, default: ~/exllama_sessions/", default = "~/exllama_sessions/")
+parser.add_argument("-sd", "--sessions_dir", type = str, help = "Location for storing user sessions, default: ~/exllama_sessions/", default = "~/exllama_sessions/")
 
 model_init.add_args(parser)
 args = parser.parse_args()
@@ -155,4 +161,4 @@ host, port = machine.split(":")
 if host == "localhost":
     Timer(1, lambda: webbrowser.open(f'http://{machine}/')).start()
 
-app.run(host = host, port = port)
+serve(app, host = host, port = port)
