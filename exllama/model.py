@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from safetensors import safe_open
 import json
 import math
+import gc
 from enum import Enum
 
 from . import cuda_ext
@@ -52,9 +53,15 @@ class ExLlamaConfig:
         self.intermediate_size = read_config["intermediate_size"]
         self.num_attention_heads = read_config["num_attention_heads"]
         self.num_hidden_layers = read_config["num_hidden_layers"]
-        self.num_attention_heads = read_config["num_attention_heads"]
         self.rms_norm_eps = read_config["rms_norm_eps"]
         self.vocab_size = read_config["vocab_size"]
+
+        if "num_key_value_heads" in read_config:
+            self.num_key_value_heads = read_config["num_key_value_heads"]
+            self.num_key_value_groups = self.num_attention_heads // self.num_key_value_heads
+        else:
+            self.num_key_value_heads = self.num_attention_heads
+            self.num_key_value_groups = 1
 
         self.rotary_embedding_base = 10000  # Constant used for pretrained models, leave as is unless retraining
         self.head_dim = self.hidden_size // self.num_attention_heads
@@ -77,6 +84,7 @@ class ExLlamaConfig:
         self.alpha_value = 1.0 # Alpha value for NTK RoPE scaling. Similar to compress_pos_emb, higher values increaste ctx but add Perplexity.
         self.gpu_peer_fix = False # Apparently Torch can have problems transferring tensors directly one GPU to another sometimes. Enable this to expliticly move tensors via system RAM instead, where needed
         self.auto_map = None  # List of floats with memory allocation in GB, per CUDA device, overrides device_map
+
         # Tuning
 
         self.matmul_recons_thd = 8
@@ -289,9 +297,21 @@ class ExLlamaAttention:
         self.index = index
 
         self.q_proj = Ex4bitLinear(config, self.config.hidden_size, self.config.num_attention_heads * self.config.head_dim, False, tensors, key + ".q_proj")
-        self.k_proj = Ex4bitLinear(config, self.config.hidden_size, self.config.num_attention_heads * self.config.head_dim, False, tensors, key + ".k_proj")
-        self.v_proj = Ex4bitLinear(config, self.config.hidden_size, self.config.num_attention_heads * self.config.head_dim, False, tensors, key + ".v_proj")
+        self.k_proj = Ex4bitLinear(config, self.config.hidden_size, self.config.num_key_value_heads * self.config.head_dim, False, tensors, key + ".k_proj")
+        self.v_proj = Ex4bitLinear(config, self.config.hidden_size, self.config.num_key_value_heads * self.config.head_dim, False, tensors, key + ".v_proj")
         self.o_proj = Ex4bitLinear(config, self.config.num_attention_heads * self.config.head_dim, self.config.hidden_size, False, tensors, key + ".o_proj")
+
+
+    def repeat_kv(self, hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+
+        # TODO: This seems inefficient. It should be possible to broadcast in the attention matmul to avoid building
+        # temporary K/V tensors like this
+
+        batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+        if n_rep == 1: return hidden_states
+
+        hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+        return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
     def fused(self, hidden_states, cache, buffer, input_layernorm, lora):
@@ -316,9 +336,9 @@ class ExLlamaAttention:
 
         # Project q, k, v, apply position embeddings to k and v, update cache
 
-        query_states = torch.empty((bsz, q_len, self.config.hidden_size), dtype = torch.float16, device = hidden_states.device)
-        key_states = torch.empty((bsz, q_len, self.config.hidden_size), dtype = torch.float16, device = hidden_states.device)
-        value_states = torch.empty((bsz, q_len, self.config.hidden_size), dtype = torch.float16, device = hidden_states.device)
+        query_states = torch.empty((bsz, q_len, self.config.num_attention_heads * self.config.head_dim), dtype = torch.float16, device = hidden_states.device)
+        key_states = torch.empty((bsz, q_len, self.config.num_key_value_heads * self.config.head_dim), dtype = torch.float16, device = hidden_states.device)
+        value_states = torch.empty((bsz, q_len, self.config.num_key_value_heads * self.config.head_dim), dtype = torch.float16, device = hidden_states.device)
 
         cuda_ext.exllama_ext.q4_attn(hidden_states,
                                      input_layernorm.weight,
@@ -334,6 +354,7 @@ class ExLlamaAttention:
                                      q_len,
                                      past_len,
                                      self.config.num_attention_heads,
+                                     self.config.num_key_value_heads,
                                      self.config.head_dim,
                                      cache.key_states[self.index],
                                      cache.value_states[self.index],
@@ -350,11 +371,16 @@ class ExLlamaAttention:
         key_states = cache.key_states[self.index].narrow(2, 0, past_len + q_len)
         value_states = cache.value_states[self.index].narrow(2, 0, past_len + q_len)
 
+        # Repeat K/V heads if num_key_value_headsn_kv_heads < n_heads
+
+        query_states.transpose_(1, 2)
+        key_states = self.repeat_kv(key_states, self.config.num_key_value_groups)
+        value_states = self.repeat_kv(value_states, self.config.num_key_value_groups)
+
         # Attention
         # TODO: Figure out if we can use cublasHgemmStridedBatched() to do this matmul without reshaping. Torch uses
         # gemmStridedBatchedEx() internally, so it should be possible.
 
-        query_states.transpose_(1, 2)
         key_states.transpose_(2, 3)
         attn_weights = torch.matmul(query_states, key_states)
         attn_weights /= math.sqrt(self.config.head_dim)
@@ -384,11 +410,11 @@ class ExLlamaAttention:
         key_states = self.k_proj.forward(hidden_states, lora)
 
         cuda_ext.exllama_ext.rope_(query_states, self.sin, self.cos, past_len, self.config.num_attention_heads, self.config.head_dim)
-        cuda_ext.exllama_ext.rope_(key_states, self.sin, self.cos, past_len, self.config.num_attention_heads, self.config.head_dim)
+        cuda_ext.exllama_ext.rope_(key_states, self.sin, self.cos, past_len, self.config.num_key_value_heads, self.config.head_dim)
 
         query_states = query_states.view(bsz, q_len, self.config.num_attention_heads, self.config.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.config.num_attention_heads, self.config.head_dim).transpose(1, 2)
-        value_states = self.v_proj.forward(hidden_states, lora).view(bsz, q_len, self.config.num_attention_heads, self.config.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.config.num_key_value_heads, self.config.head_dim).transpose(1, 2)
+        value_states = self.v_proj.forward(hidden_states, lora).view(bsz, q_len, self.config.num_key_value_heads, self.config.head_dim).transpose(1, 2)
 
         # Add keys and values to cache
 
@@ -402,6 +428,11 @@ class ExLlamaAttention:
         key_states = cache.key_states[self.index].narrow(2, 0, past_len + q_len)
         value_states = cache.value_states[self.index].narrow(2, 0, past_len + q_len)
 
+        # Repeat K/V heads if num_key_value_headsn_kv_heads < n_heads
+
+        key_states = self.repeat_kv(key_states, self.config.num_key_value_groups)
+        value_states = self.repeat_kv(value_states, self.config.num_key_value_groups)
+
         # Attention
 
         # -- HF Transformers regular attention, faster on shorter sequences, same VRAM usage
@@ -411,7 +442,7 @@ class ExLlamaAttention:
             attn_weights = torch.matmul(query_states, key_states.transpose(2, 3))
             attn_weights /= math.sqrt(self.config.head_dim)
             if buffer.attn_mask is not None: attn_weights = attn_weights + buffer.attn_mask
-            attn_weights = nn.functional.softmax(attn_weights, dim = -1, dtype = torch.float16).to(query_states.dtype)
+            attn_weights = nn.functional.softmax(attn_weights, dim = -1, dtype = torch.float16)
             attn_output = torch.matmul(attn_weights, value_states)
             attn_output = attn_output.transpose(1, 2)
 
@@ -509,8 +540,8 @@ class ExLlamaCache:
 
             if copy_from is None:
 
-                p_key_states = torch.zeros(self.batch_size, self.config.num_attention_heads, self.max_seq_len, self.config.head_dim, dtype = torch.float16, device = self.model.config.device_map.layers[i])
-                p_value_states = torch.zeros(self.batch_size, self.config.num_attention_heads, self.max_seq_len, self.config.head_dim, dtype = torch.float16, device = self.model.config.device_map.layers[i])
+                p_key_states = torch.zeros(self.batch_size, self.config.num_key_value_heads, self.max_seq_len, self.config.head_dim, dtype = torch.float16, device = self.model.config.device_map.layers[i])
+                p_value_states = torch.zeros(self.batch_size, self.config.num_key_value_heads, self.max_seq_len, self.config.head_dim, dtype = torch.float16, device = self.model.config.device_map.layers[i])
 
             else:
 
@@ -519,6 +550,13 @@ class ExLlamaCache:
 
             self.key_states.append(p_key_states)
             self.value_states.append(p_value_states)
+
+
+    def zero(self):
+
+        for i in range(self.config.num_hidden_layers):
+            self.key_states[i].zero_()
+            self.value_states[i].zero_()
 
 
     def clone(self):
@@ -579,7 +617,12 @@ class ExLlamaDeviceMap:
         return sorted(list(set(self.layers)))
 
 
-    def map(self, key, loading = False):
+    def get_all_devs(self):
+
+        return sorted(list(set(self.layers + [self.lm_head, self.norm, self.embed_tokens])))
+
+
+    def map(self, key):
 
         if key.startswith("lm_head."): return self.lm_head
         if key.startswith("model.embed_tokens."): return self.embed_tokens
@@ -631,6 +674,14 @@ def _move_tensor(tensor, new_device, name, config):
             tensor = tensor.to("cpu")
     return tensor.to(new_device)
 
+def _layer_dtype_size(key):
+    if key.endswith(".weight"): return 2
+    if key.endswith(".qweight"): return 4
+    if key.endswith(".qzeros"): return 4
+    if key.endswith(".scales"): return 2
+    if key.endswith(".g_idx"): return 0
+    raise ValueError("Unrecognized layer: " + key)
+
 
 class ExLlama:
 
@@ -645,7 +696,7 @@ class ExLlama:
         # Load model weights
 
         tensors = {}
-        with safe_open(self.config.model_path, framework="pt", device="cpu") as f:
+        with safe_open(self.config.model_path, framework = "pt", device = "cpu") as f:
 
             # Begin auto mapping if enabled
 
@@ -664,16 +715,22 @@ class ExLlama:
                     if _skip_key(key): continue
 
                     if key.startswith("model.layers.0."):
-                        tensor = f.get_tensor(key)
-                        decoder_size += tensor.numel() * tensor.element_size()
+                        tensor_slice = f.get_slice(key)
+                        shape = tensor_slice.get_shape()
+                        decoder_size += math.prod(shape) * _layer_dtype_size(key)
+                        del tensor_slice
 
                     if key.startswith("model.norm."):
-                        tensor = f.get_tensor(key)
-                        norm_size += tensor.numel() * tensor.element_size()
+                        tensor_slice = f.get_slice(key)
+                        shape = tensor_slice.get_shape()
+                        norm_size += math.prod(shape) * _layer_dtype_size(key)
+                        del tensor_slice
 
                     if key.startswith("lm_head."):
-                        tensor = f.get_tensor(key)
-                        head_size += tensor.numel() * tensor.element_size()
+                        tensor_slice = f.get_slice(key)
+                        shape = tensor_slice.get_shape()
+                        head_size += math.prod(shape) * _layer_dtype_size(key)
+                        del tensor_slice
 
                 # Assign layers automatically
 
@@ -703,29 +760,47 @@ class ExLlama:
                     device_usage += this_layer_size
                     layer_index_device += 1
 
-            # Load tensors, move to device(s)
+        # Read tensor list from file
 
-            max_dq_buffer_size = 0
-
+        load_keys = []
+        with safe_open(self.config.model_path, framework = "pt", device = "cpu") as f:
             for key in f.keys():
+                load_keys.append(key)
 
-                if _skip_key(key): continue
+        # Load up to 1 GB of tensors at a time, closing and reopening the file in between each chunk
 
-                device = self.config.device_map.map(key, loading = True)
-                tensor = f.get_tensor(key)
+        max_dq_buffer_size = 0
+        f = None
+        st_mem = 0
+        MAX_ST_MEM = 1024**3
 
-                if key.endswith(".scales"): tensor = tensor.half()
-                if key == "lm_head.weight": tensor = tensor.float() if device == "cpu" else tensor.half()
-                if key == "model.norm.weight": tensor = tensor.half()
-                if key.endswith(".embed_tokens.weight"): tensor = tensor.half()
-                if key.endswith(".input_layernorm.weight"): tensor = tensor.half()
-                if key.endswith(".post_attention_layernorm.weight"): tensor = tensor.half()
+        for key in load_keys:
 
-                tensor = tensor.to(device, non_blocking = True)
+            if _skip_key(key): continue
+            device = self.config.device_map.map(key)
 
-                if key.endswith(".qweight"): max_dq_buffer_size = max(max_dq_buffer_size, tensor.numel() * 8)
+            if f is None or st_mem > MAX_ST_MEM:
+                if f is not None: del f
+                f = safe_open(self.config.model_path, framework = "pt", device = "cpu")
+                st_mem = 0
 
-                tensors[key] = tensor
+            tensor = f.get_tensor(key)
+            size = tensor.numel() * tensor.element_size()
+            st_mem += size
+
+            if key.endswith(".scales"): tensor = tensor.half()
+            if key == "lm_head.weight": tensor = tensor.float() if device == "cpu" else tensor.half()
+            if key == "model.norm.weight": tensor = tensor.half()
+            if key.endswith(".embed_tokens.weight"): tensor = tensor.half()
+            if key.endswith(".input_layernorm.weight"): tensor = tensor.half()
+            if key.endswith(".post_attention_layernorm.weight"): tensor = tensor.half()
+
+            tensor = tensor.to(device, non_blocking = True)
+            if key.endswith(".qweight"): max_dq_buffer_size = max(max_dq_buffer_size, tensor.numel() * 8)
+
+            tensors[key] = tensor
+
+        del f
 
         # Head
 

@@ -437,6 +437,7 @@ void q4_attn
     int q_len,
     int past_len,
     int num_heads,
+    int num_kv_heads,
     int head_dim,
     torch::Tensor key_cache,
     torch::Tensor value_cache,
@@ -488,6 +489,7 @@ void q4_attn
         dim,
         head_dim,
         num_heads,
+        num_kv_heads,
         past_len,
         (half*) key_cache.data_ptr(),
         (half*) value_cache.data_ptr(),
@@ -518,6 +520,7 @@ void q4_attn_2
 {
     TORCH_CHECK_DTYPE(x, kHalf);
     TORCH_CHECK_DTYPE(attn_output, kHalf);
+    const at::cuda::OptionalCUDAGuard device_guard(x.device());
 
     int height = x.size(0);
 
